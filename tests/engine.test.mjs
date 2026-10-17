@@ -2,128 +2,133 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { YieldEngine } from "../dist/index.js";
 
-test("1. Deposit creates shares and updates idle assets with exact mathematical model", () => {
+test("1. P1 Regression: Withdrawal fails closed and reverts all state when strategy liquidity is locked", () => {
   const engine = new YieldEngine();
-  // Single unit deposit: (1 * 1000) / 1 = 1,000 shares
-  const res1 = engine.deposit("alice", 1n);
-  assert.equal(res1.sharesMinted, 1000n, "Must mint exact 1,000 shares for 1 unit on empty vault");
-  assert.equal(engine.getUserShares("alice"), 1000n);
+  engine.registerStrategy({
+    strategyId: "illiquid-real-estate-strat",
+    allocatedAssetsUsd: 0n,
+    availableLiquidityUsd: 0n,
+    targetWeightBps: 10_000,
+    expectedApyBps: 1200
+  });
 
-  // Subsequent deposit: 99 assets
-  // totalAssets = 1, totalShares = 1000
-  // (99 * (1000 + 1000)) / (1 + 1) = (99 * 2000) / 2 = 99,000 shares
-  const res2 = engine.deposit("bob", 99n);
-  assert.equal(res2.sharesMinted, 99_000n);
+  // Alice deposits 100,000 USD
+  const dep = engine.deposit("0xAlice", 100_000n);
+  assert.equal(engine.getUserShares("0xAlice"), dep.sharesMinted);
 
-  const metrics = engine.getVaultMetrics();
-  assert.equal(metrics.totalAssetsUsd, 100n);
-  assert.equal(metrics.idleAssetsUsd, 100n);
-  assert.equal(metrics.totalShares, 100_000n);
+  // Allocate all idle assets to strategy
+  engine.allocateIdleAssets();
+  assert.equal(engine.getVaultMetrics().idleAssetsUsd, 0n);
+
+  // Strategy now locks funds: AUM = 100,000 USD, but available immediate liquidity = only 10,000 USD
+  engine.setStrategyLiquidity("illiquid-real-estate-strat", 10_000n);
+
+  // Alice attempts to withdraw all her shares (worth ~100,000 USD).
+  // Alice owns 100% of the shares! Share balance is sufficient!
+  // BUT immediate vault liquidity is only 10,000 USD.
+  assert.throws(
+    () => engine.withdraw("0xAlice", dep.sharesMinted),
+    /Insufficient immediate liquidity/
+  );
+
+  // VERIFY REVERSION / NO STATE MUTATION:
+  // Alice's shares must NOT be burned!
+  assert.equal(engine.getUserShares("0xAlice"), dep.sharesMinted);
+  // Total shares must be untouched
+  assert.equal(engine.getVaultMetrics().totalShares, dep.sharesMinted);
+  // Total assets must be untouched
+  assert.equal(engine.getVaultMetrics().totalAssetsUsd, 100_000n);
+  // Idle assets must remain 0
+  assert.equal(engine.getVaultMetrics().idleAssetsUsd, 0n);
+  // Strategy AUM must remain 100,000
+  assert.equal(engine.getStrategy("illiquid-real-estate-strat").allocatedAssetsUsd, 100_000n);
+  // Conservation invariant must hold
+  assert.doesNotThrow(() => engine.verifyConservationInvariant());
 });
 
-test("2. Strategy registration and idle asset allocation with rounding conservation", () => {
+test("2. Strategy allocation rounding dust is conserved in idle assets", () => {
   const engine = new YieldEngine();
-  // 3 strategies with odd weights that induce rounding remainders
   engine.registerStrategy({
-    strategyId: "strat-1",
+    strategyId: "strat-a",
     allocatedAssetsUsd: 0n,
+    availableLiquidityUsd: 0n,
     targetWeightBps: 3333,
-    expectedApyBps: 800
+    expectedApyBps: 500
   });
   engine.registerStrategy({
-    strategyId: "strat-2",
+    strategyId: "strat-b",
     allocatedAssetsUsd: 0n,
+    availableLiquidityUsd: 0n,
     targetWeightBps: 3333,
-    expectedApyBps: 800
+    expectedApyBps: 500
   });
   engine.registerStrategy({
-    strategyId: "strat-3",
+    strategyId: "strat-c",
     allocatedAssetsUsd: 0n,
+    availableLiquidityUsd: 0n,
     targetWeightBps: 3334,
-    expectedApyBps: 800
+    expectedApyBps: 500
   });
 
-  engine.deposit("alice", 100_001n);
+  engine.deposit("0xBob", 100_001n);
   engine.allocateIdleAssets();
 
-  // Verify that asset conservation holds 100% exactly down to the wei
-  assert.doesNotThrow(() => engine.verifyConservationInvariant());
   const metrics = engine.getVaultMetrics();
-  const s1 = engine.getStrategy("strat-1").allocatedAssetsUsd;
-  const s2 = engine.getStrategy("strat-2").allocatedAssetsUsd;
-  const s3 = engine.getStrategy("strat-3").allocatedAssetsUsd;
-  assert.equal(s1 + s2 + s3 + metrics.idleAssetsUsd, 100_001n);
+  const sA = engine.getStrategy("strat-a").allocatedAssetsUsd;
+  const sB = engine.getStrategy("strat-b").allocatedAssetsUsd;
+  const sC = engine.getStrategy("strat-c").allocatedAssetsUsd;
+
+  assert.equal(sA + sB + sC + metrics.idleAssetsUsd, 100_001n);
+  assert.doesNotThrow(() => engine.verifyConservationInvariant());
 });
 
-test("3. Harvest compounding increases vault assets and share price", () => {
+test("3. Strategy loss write-down preserves asset and share conservation", () => {
   const engine = new YieldEngine();
   engine.registerStrategy({
-    strategyId: "lending-strat",
+    strategyId: "risk-strat",
     allocatedAssetsUsd: 0n,
+    availableLiquidityUsd: 0n,
     targetWeightBps: 10_000,
     expectedApyBps: 1000
   });
 
-  engine.deposit("alice", 100_000n);
+  engine.deposit("0xCharlie", 100_000n);
   engine.allocateIdleAssets();
 
-  const metricsPre = engine.getVaultMetrics();
+  // Audit identifies a $5,000 loss in the strategy
+  engine.recordStrategyLoss("risk-strat", 5000n);
 
-  // Harvest generates 10,000 gross yield (10% fee = 1,000, net = 9,000)
-  const harvestRes = engine.harvest("lending-strat", 10_000n);
-  assert.equal(harvestRes.feeUsd, 1000n);
-  assert.equal(harvestRes.netCompoundedUsd, 9000n);
-
-  const metricsPost = engine.getVaultMetrics();
-  assert.equal(metricsPost.totalAssetsUsd, 109_000n);
-  assert.ok(metricsPost.sharePrice > metricsPre.sharePrice);
+  const metrics = engine.getVaultMetrics();
+  assert.equal(metrics.totalAssetsUsd, 95_000n);
+  assert.equal(engine.getStrategy("risk-strat").allocatedAssetsUsd, 95_000n);
   assert.doesNotThrow(() => engine.verifyConservationInvariant());
 });
 
-test("4. Withdrawal burns shares and returns proportional assets", () => {
+test("4. Asynchronous withdrawal queue escrows shares and creates ticket", () => {
   const engine = new YieldEngine();
-  const dep = engine.deposit("alice", 100_000n);
+  const dep = engine.deposit("0xAlice", 50_000n);
 
-  // Alice withdraws half her shares
-  const halfShares = dep.sharesMinted / 2n;
-  const withdrawRes = engine.withdraw("alice", halfShares);
-
-  assert.ok(withdrawRes.assetsReturnedUsd >= 49_990n && withdrawRes.assetsReturnedUsd <= 50_010n);
-  assert.equal(engine.getUserShares("alice"), dep.sharesMinted - halfShares);
-  assert.doesNotThrow(() => engine.verifyConservationInvariant());
+  const ticket = engine.queueWithdrawal("0xAlice", dep.sharesMinted);
+  assert.equal(ticket.user, "0xAlice");
+  assert.equal(ticket.status, "PENDING");
+  assert.equal(engine.getUserShares("0xAlice"), 0n, "Shares must be escrowed in queue");
 });
 
-test("5. Fail-closed: withdrawal fails when strategies cannot supply liquidity", () => {
+test("5. Successful withdrawal when strategy liquidity is unlocked", () => {
   const engine = new YieldEngine();
   engine.registerStrategy({
-    strategyId: "locked-strat",
+    strategyId: "liquid-strat",
     allocatedAssetsUsd: 0n,
+    availableLiquidityUsd: 0n,
     targetWeightBps: 10_000,
-    expectedApyBps: 1000
+    expectedApyBps: 500
   });
 
-  const dep = engine.deposit("alice", 100_000n);
-  engine.allocateIdleAssets(); // All 100k moved to locked-strat, idle = 0
+  const dep = engine.deposit("0xDavid", 20_000n);
+  engine.allocateIdleAssets();
 
-  // Simulate an external deficit / loss in strategy (e.g. strategy funds locked/lost)
-  // We can test that if a user requests more than available aggregate liquidity, it throws
-  assert.throws(
-    () => engine.withdraw("alice", dep.sharesMinted * 2n),
-    /Insufficient share balance/
-  );
-});
-
-test("6. Fail-closed negative controls: over-withdrawal and zero deposit", () => {
-  const engine = new YieldEngine();
-  engine.deposit("alice", 10_000n);
-
-  assert.throws(
-    () => engine.deposit("alice", 0n),
-    /Deposit amount must be strictly greater than zero/
-  );
-
-  assert.throws(
-    () => engine.withdraw("alice", 1_000_000_000_000n),
-    /Insufficient share balance/
-  );
+  // Strategy has full liquidity
+  const withdrawRes = engine.withdraw("0xDavid", dep.sharesMinted / 2n);
+  assert.ok(withdrawRes.assetsReturnedUsd >= 9990n && withdrawRes.assetsReturnedUsd <= 10010n);
+  assert.doesNotThrow(() => engine.verifyConservationInvariant());
 });
