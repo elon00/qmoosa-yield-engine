@@ -1,0 +1,26 @@
+{
+  "name": "@qmoosa/yield-engine",
+  "version": "1.0.0",
+  "description": "Automated Yield Aggregation & Vaults — Strategy allocator, harvest compounding engine & accounting state machine",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test tests/engine.test.mjs",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  },
+  "keywords": [
+    "qmoosa",
+    "yield",
+    "engine",
+    "vault",
+    "strategies"
+  ],
+  "author": "elon00",
+  "license": "MIT"
+}
