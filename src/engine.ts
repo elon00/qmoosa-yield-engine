@@ -1,4 +1,4 @@
-import { VaultState, StrategyAllocation, QueuedWithdrawal } from "./types.js";
+import { VaultState, StrategyAllocation, VaultStateSnapshot } from "./types.js";
 
 export class YieldEngine {
   public static readonly BPS_DIVISOR = 10_000n;
@@ -6,7 +6,6 @@ export class YieldEngine {
   public static readonly VIRTUAL_ASSETS = 1n;
 
   private vault: VaultState;
-  private nextQueueId: bigint = 1n;
 
   constructor(vaultId: string = "qmoosa-usdc-vault", asset: string = "USDC") {
     this.vault = {
@@ -17,7 +16,6 @@ export class YieldEngine {
       idleAssetsUsd: 0n,
       strategies: new Map(),
       userShares: new Map(),
-      withdrawalQueue: [],
       performanceFeeBps: 1000 // 10%
     };
   }
@@ -26,14 +24,43 @@ export class YieldEngine {
     if (this.vault.strategies.has(strategy.strategyId)) {
       throw new Error(`Strategy ${strategy.strategyId} already registered`);
     }
-    const availableLiquidity = strategy.availableLiquidityUsd !== undefined
-      ? strategy.availableLiquidityUsd
-      : strategy.allocatedAssetsUsd;
-
     this.vault.strategies.set(strategy.strategyId, {
       ...strategy,
-      availableLiquidityUsd: availableLiquidity
+      liquidAssetsUsd: strategy.liquidAssetsUsd ?? strategy.allocatedAssetsUsd
     });
+  }
+
+  public setStrategyLiquidity(strategyId: string, liquidAssetsUsd: bigint): void {
+    const strat = this.vault.strategies.get(strategyId);
+    if (!strat) throw new Error(`Strategy ${strategyId} not found`);
+    if (liquidAssetsUsd < 0n || liquidAssetsUsd > strat.allocatedAssetsUsd) {
+      throw new RangeError("Liquid assets must be between 0 and allocatedAssetsUsd");
+    }
+    strat.liquidAssetsUsd = liquidAssetsUsd;
+  }
+
+  public createSnapshot(): VaultStateSnapshot {
+    const strategiesClone = new Map<string, StrategyAllocation>();
+    for (const [k, v] of this.vault.strategies.entries()) {
+      strategiesClone.set(k, { ...v });
+    }
+    const userSharesClone = new Map<string, bigint>(this.vault.userShares);
+
+    return {
+      totalAssetsUsd: this.vault.totalAssetsUsd,
+      totalShares: this.vault.totalShares,
+      idleAssetsUsd: this.vault.idleAssetsUsd,
+      strategies: strategiesClone,
+      userShares: userSharesClone
+    };
+  }
+
+  public restoreSnapshot(snapshot: VaultStateSnapshot): void {
+    this.vault.totalAssetsUsd = snapshot.totalAssetsUsd;
+    this.vault.totalShares = snapshot.totalShares;
+    this.vault.idleAssetsUsd = snapshot.idleAssetsUsd;
+    this.vault.strategies = snapshot.strategies;
+    this.vault.userShares = snapshot.userShares;
   }
 
   public deposit(user: string, assetsUsd: bigint): { sharesMinted: bigint } {
@@ -44,7 +71,6 @@ export class YieldEngine {
       throw new Error("User address must not be empty");
     }
 
-    // ERC-4626 standard conversion with virtual assets and shares
     const numerator = assetsUsd * (this.vault.totalShares + YieldEngine.VIRTUAL_OFFSET);
     const denominator = this.vault.totalAssetsUsd + YieldEngine.VIRTUAL_ASSETS;
     const sharesMinted = numerator / denominator;
@@ -53,7 +79,7 @@ export class YieldEngine {
       throw new Error("Deposit produces zero shares: transaction rejected to prevent dilution");
     }
 
-    // Atomic state update
+    // Update vault state atomically
     this.vault.totalAssetsUsd += assetsUsd;
     this.vault.idleAssetsUsd += assetsUsd;
     this.vault.totalShares += sharesMinted;
@@ -66,8 +92,8 @@ export class YieldEngine {
   }
 
   /**
-   * Immediate withdrawal. Fails closed with rollback/no-op semantics if immediate available liquidity
-   * (idle assets + strategy available liquidity) cannot satisfy the full payout.
+   * Withdraws assets by burning user shares with independent liquidity checks
+   * and transactional atomic rollback if available liquidity cannot supply the deficit.
    */
   public withdraw(user: string, sharesToBurn: bigint): { assetsReturnedUsd: bigint } {
     if (sharesToBurn <= 0n) {
@@ -86,72 +112,58 @@ export class YieldEngine {
       throw new Error("Withdrawal evaluates to zero assets");
     }
 
-    // Measure immediate liquid assets (NOT total illiquid AUM)
-    const totalAvailableLiquidity = this.vault.idleAssetsUsd + Array.from(this.vault.strategies.values()).reduce(
-      (sum, s) => sum + s.availableLiquidityUsd,
+    // Check independent liquid strategy assets (not just allocated assets)
+    const totalLiquidStrategyAssets = Array.from(this.vault.strategies.values()).reduce(
+      (sum, s) => sum + (s.liquidAssetsUsd ?? s.allocatedAssetsUsd),
       0n
     );
+    const totalAvailableLiquidity = this.vault.idleAssetsUsd + totalLiquidStrategyAssets;
 
-    // Fail closed: if available liquidity is insufficient, REVERT without mutating any state
+    // Fail closed if liquid assets cannot fulfill withdrawal
     if (assetsReturnedUsd > totalAvailableLiquidity) {
       throw new Error(
-        `Insufficient immediate liquidity: requested ${assetsReturnedUsd}, available liquid ${totalAvailableLiquidity}`
+        `Insufficient liquid strategy assets: requested ${assetsReturnedUsd}, available liquid ${totalAvailableLiquidity}`
       );
     }
 
-    // Pull from idle assets first, then unlocked strategy liquidity
-    if (this.vault.idleAssetsUsd < assetsReturnedUsd) {
-      const deficit = assetsReturnedUsd - this.vault.idleAssetsUsd;
-      let pulled = 0n;
-      for (const strat of this.vault.strategies.values()) {
-        const needed = deficit - pulled;
-        const canPull = strat.availableLiquidityUsd > needed ? needed : strat.availableLiquidityUsd;
-        strat.availableLiquidityUsd -= canPull;
-        strat.allocatedAssetsUsd -= canPull;
-        pulled += canPull;
-        if (pulled >= deficit) break;
+    // Snapshot state for atomic rollback protection
+    const snapshot = this.createSnapshot();
+
+    try {
+      if (this.vault.idleAssetsUsd < assetsReturnedUsd) {
+        const deficit = assetsReturnedUsd - this.vault.idleAssetsUsd;
+        let pulled = 0n;
+
+        for (const strat of this.vault.strategies.values()) {
+          const maxLiquid = strat.liquidAssetsUsd ?? strat.allocatedAssetsUsd;
+          const needed = deficit - pulled;
+          const canPull = maxLiquid > needed ? needed : maxLiquid;
+
+          strat.allocatedAssetsUsd -= canPull;
+          strat.liquidAssetsUsd = maxLiquid - canPull;
+          pulled += canPull;
+          if (pulled >= deficit) break;
+        }
+
+        if (pulled < deficit) {
+          throw new Error("Strategy liquidity pull failed to cover deficit");
+        }
+        this.vault.idleAssetsUsd = 0n;
+      } else {
+        this.vault.idleAssetsUsd -= assetsReturnedUsd;
       }
-      this.vault.idleAssetsUsd = 0n;
-    } else {
-      this.vault.idleAssetsUsd -= assetsReturnedUsd;
+
+      this.vault.totalAssetsUsd -= assetsReturnedUsd;
+      this.vault.totalShares -= sharesToBurn;
+      this.vault.userShares.set(user, currentShares - sharesToBurn);
+
+      this.verifyConservationInvariant();
+      return { assetsReturnedUsd };
+    } catch (err) {
+      // Atomic rollback: restore entire vault state on failure
+      this.restoreSnapshot(snapshot);
+      throw err;
     }
-
-    this.vault.totalAssetsUsd -= assetsReturnedUsd;
-    this.vault.totalShares -= sharesToBurn;
-    this.vault.userShares.set(user, currentShares - sharesToBurn);
-
-    this.verifyConservationInvariant();
-    return { assetsReturnedUsd };
-  }
-
-  /**
-   * Enqueues an asynchronous withdrawal request when strategy liquidity is locked.
-   */
-  public queueWithdrawal(user: string, sharesToBurn: bigint): QueuedWithdrawal {
-    if (sharesToBurn <= 0n) throw new Error("Shares to burn must be strictly positive");
-    const currentShares = this.vault.userShares.get(user) ?? 0n;
-    if (currentShares < sharesToBurn) {
-      throw new Error(`Insufficient share balance: user holds ${currentShares}, requested ${sharesToBurn}`);
-    }
-
-    const numerator = sharesToBurn * (this.vault.totalAssetsUsd + YieldEngine.VIRTUAL_ASSETS);
-    const denominator = this.vault.totalShares + YieldEngine.VIRTUAL_OFFSET;
-    const assetsExpectedUsd = numerator / denominator;
-
-    // Escrow user shares
-    this.vault.userShares.set(user, currentShares - sharesToBurn);
-
-    const queued: QueuedWithdrawal = {
-      id: `REQ-${this.nextQueueId++}`,
-      user,
-      sharesToBurn,
-      assetsExpectedUsd,
-      requestedAt: Date.now(),
-      status: "PENDING"
-    };
-
-    this.vault.withdrawalQueue.push(queued);
-    return { ...queued };
   }
 
   public allocateIdleAssets(): void {
@@ -169,52 +181,29 @@ export class YieldEngine {
     for (const strat of this.vault.strategies.values()) {
       const alloc = (toAllocate * BigInt(strat.targetWeightBps)) / BigInt(totalWeight);
       strat.allocatedAssetsUsd += alloc;
-      strat.availableLiquidityUsd += alloc;
+      strat.liquidAssetsUsd = (strat.liquidAssetsUsd ?? 0n) + alloc;
       allocatedSum += alloc;
     }
 
-    // Preserve rounding remainder in idle assets
     this.vault.idleAssetsUsd -= allocatedSum;
     this.verifyConservationInvariant();
   }
 
-  /**
-   * Records an audited loss or write-down in a strategy.
-   */
-  public recordStrategyLoss(strategyId: string, lossUsd: bigint): void {
-    const strat = this.vault.strategies.get(strategyId);
-    if (!strat) throw new Error(`Strategy ${strategyId} not found`);
-    if (lossUsd <= 0n) throw new RangeError("Loss must be positive");
-
-    const actualLoss = lossUsd > strat.allocatedAssetsUsd ? strat.allocatedAssetsUsd : lossUsd;
-    strat.allocatedAssetsUsd -= actualLoss;
-    strat.availableLiquidityUsd = strat.availableLiquidityUsd > actualLoss
-      ? strat.availableLiquidityUsd - actualLoss
-      : 0n;
-
-    this.vault.totalAssetsUsd -= actualLoss;
-    this.verifyConservationInvariant();
-  }
-
-  public setStrategyLiquidity(strategyId: string, availableLiquidityUsd: bigint): void {
-    const strat = this.vault.strategies.get(strategyId);
-    if (!strat) throw new Error(`Strategy ${strategyId} not found`);
-    if (availableLiquidityUsd > strat.allocatedAssetsUsd) {
-      throw new RangeError("Available liquidity cannot exceed total allocated AUM");
-    }
-    strat.availableLiquidityUsd = availableLiquidityUsd;
-  }
-
   public harvest(strategyId: string, grossYieldUsd: bigint): { netCompoundedUsd: bigint; feeUsd: bigint } {
     const strat = this.vault.strategies.get(strategyId);
-    if (!strat) throw new Error(`Strategy ${strategyId} not found`);
-    if (grossYieldUsd <= 0n) return { netCompoundedUsd: 0n, feeUsd: 0n };
+    if (!strat) {
+      throw new Error(`Strategy ${strategyId} not found`);
+    }
+    if (grossYieldUsd <= 0n) {
+      return { netCompoundedUsd: 0n, feeUsd: 0n };
+    }
 
     const feeUsd = (grossYieldUsd * BigInt(this.vault.performanceFeeBps)) / YieldEngine.BPS_DIVISOR;
     const netCompoundedUsd = grossYieldUsd - feeUsd;
 
+    // Compound directly into strategy
     strat.allocatedAssetsUsd += netCompoundedUsd;
-    strat.availableLiquidityUsd += netCompoundedUsd;
+    strat.liquidAssetsUsd = (strat.liquidAssetsUsd ?? 0n) + netCompoundedUsd;
     this.vault.totalAssetsUsd += netCompoundedUsd;
 
     this.verifyConservationInvariant();
